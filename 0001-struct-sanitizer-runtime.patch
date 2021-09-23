@@ -1,0 +1,207 @@
+From ff7d75d3bb719f9eb664a484187259ec948a4212 Mon Sep 17 00:00:00 2001
+From: tcs_kernel <tcs_kernel@tencent.com>
+Date: Wed, 15 Sep 2021 19:03:13 +0800
+Subject: [PATCH 1/1] struct sanitizer runtime
+kernel commit: d163a925ebbc6eb5b562b0f1d72c7e817aa75c40
+---
+ arch/x86/kernel/vmlinux.lds.S |  9 +++++++-
+ include/linux/struct_san.h    |  7 ++++++
+ init/main.c                   |  2 ++
+ kernel/Makefile               |  4 ++--
+ kernel/module.c               | 17 +++++++++++++-
+ kernel/struct_san.c           | 52 +++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 87 insertions(+), 4 deletions(-)
+ create mode 100644 include/linux/struct_san.h
+ create mode 100644 kernel/struct_san.c
+
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index efd9e9e..b1d8ab2 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -182,6 +182,13 @@ SECTIONS
+ 		_edata = .;
+ 	} :data
+ 
++    .sanitize_struct : AT(ADDR(.sanitize_struct) - LOAD_OFFSET)
++	{
++		__sanitize_struct_start = .;
++		*(.sanitize_struct)
++		__sanitize_struct_stop = .;
++	}
++
+ 	BUG_TABLE
+ 
+ 	ORC_UNWIND_TABLE
+@@ -347,7 +354,7 @@ SECTIONS
+ 		. = ALIGN(PAGE_SIZE);
+ 		__smp_locks_end = .;
+ 	}
+-
++	
+ #ifdef CONFIG_X86_64
+ 	.data_nosave : AT(ADDR(.data_nosave) - LOAD_OFFSET) {
+ 		NOSAVE_DATA
+diff --git a/include/linux/struct_san.h b/include/linux/struct_san.h
+new file mode 100644
+index 0000000..67140ff
+--- /dev/null
++++ b/include/linux/struct_san.h
+@@ -0,0 +1,7 @@
++#ifndef _LINUX_STRUCT_SAN_H
++#define _LINUX_STRUCT_SAN_H
++
++void struct_san_init(void);
++void struct_san_range_init(u64* start, u64* end);
++
++#endif
+diff --git a/init/main.c b/init/main.c
+index 53b2788..c12efc7 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -96,6 +96,7 @@
+ #include <linux/jump_label.h>
+ #include <linux/mem_encrypt.h>
+ #include <linux/kcsan.h>
++#include <linux/struct_san.h>
+ #include <linux/init_syscalls.h>
+ #include <linux/stackdepot.h>
+ 
+@@ -1059,6 +1060,7 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
+ 	acpi_subsystem_init();
+ 	arch_post_acpi_subsys_init();
+ 	kcsan_init();
++	struct_san_init();
+ 
+ 	/* Do the rest non-__init'ed, we're now alive */
+ 	arch_call_rest_init();
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 320f1f3..cd859f5 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -3,14 +3,14 @@
+ # Makefile for the linux kernel.
+ #
+ 
+-obj-y     = fork.o exec_domain.o panic.o \
++obj-y     =  struct_san.o fork.o exec_domain.o panic.o \
+ 	    cpu.o exit.o softirq.o resource.o \
+ 	    sysctl.o capability.o ptrace.o user.o \
+ 	    signal.o sys.o umh.o workqueue.o pid.o task_work.o \
+ 	    extable.o params.o \
+ 	    kthread.o sys_ni.o nsproxy.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+-	    async.o range.o smpboot.o ucount.o regset.o
++	    async.o range.o smpboot.o ucount.o regset.o 
+ 
+ obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
+ obj-$(CONFIG_MODULES) += kmod.o
+diff --git a/kernel/module.c b/kernel/module.c
+index 3047935..48a0c97 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -57,6 +57,7 @@
+ #include <linux/dynamic_debug.h>
+ #include <linux/audit.h>
+ #include <uapi/linux/module.h>
++#include <linux/struct_san.h>
+ #include "module-internal.h"
+ 
+ #define CREATE_TRACE_POINTS
+@@ -105,7 +106,6 @@
+  * __module_address() hard by doing a lot of stack unwinding; potentially from
+  * NMI context.
+  */
+-
+ static __always_inline unsigned long __mod_tree_val(struct latch_tree_node *n)
+ {
+ 	struct module_layout *layout = container_of(n, struct module_layout, mtn.node);
+@@ -3866,6 +3866,19 @@ static int unknown_module_param_cb(char *param, char *val, const char *modname,
+ 	return 0;
+ }
+ 
++void struct_san_module_init(struct load_info *info)
++{
++    u8 *start, *end;
++    unsigned int sec = find_sec(info, ".sanitize_struct");
++
++    if (!sec)
++        return;
++
++    start = (u8 *)info->sechdrs[sec].sh_addr;
++    end = start + info->sechdrs[sec].sh_size;
++    struct_san_range_init((u64 *)start, (u64 *)end);
++}
++
+ /*
+  * Allocate and load the module: note that size of section 0 is always
+  * zero, and we rely on this for optional sections.
+@@ -3997,6 +4010,8 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ 
+ 	flush_module_icache(mod);
+ 
++	struct_san_module_init(info);
++
+ 	/* Now copy in args */
+ 	mod->args = strndup_user(uargs, ~0UL >> 1);
+ 	if (IS_ERR(mod->args)) {
+diff --git a/kernel/struct_san.c b/kernel/struct_san.c
+new file mode 100644
+index 0000000..f0607bd
+--- /dev/null
++++ b/kernel/struct_san.c
+@@ -0,0 +1,52 @@
++#include <linux/types.h>
++#include <asm/string_64.h>
++#include <linux/vmalloc.h>
++#include <linux/set_memory.h>
++#include <linux/struct_san.h>
++#include <linux/module.h>
++#include <linux/const.h>
++#include <linux/sizes.h>
++
++#define STRUCT_MAX_NR (_UL(SZ_128M))
++
++#define STRUCT_SAN_RANGE (STRUCT_MAX_NR >> PAGE_SHIFT)
++
++extern u64 __sanitize_struct_start[];
++extern u64 __sanitize_struct_stop[];
++
++u8 *globl_offset;
++
++void struct_san_init(void)
++{
++	globl_offset = vmalloc(STRUCT_MAX_NR);
++	if (!globl_offset)
++		panic("Couldn't allocate struct sanitizer globl offset");
++	memset(globl_offset, 0, STRUCT_MAX_NR);
++	struct_san_range_init((u64 *)&__sanitize_struct_start,
++			      (u64 *)&__sanitize_struct_stop);
++}
++
++void struct_san_range_init(u64 *start, u64 *end)
++{
++	u64 *p = start;
++
++	set_memory_rw((unsigned long)globl_offset, STRUCT_SAN_RANGE);
++
++	for (; p != end; ++p) {
++		u64 fn = *p;
++		u64 off = (fn ^ (u64)p) % STRUCT_MAX_NR;
++		globl_offset[off] = 1;
++	}
++
++	set_memory_ro((unsigned long)globl_offset, STRUCT_SAN_RANGE);
++}
++
++void *__sanitizer_struct_guard__(void *p, void *fn)
++{
++	u64 off = (((u64)p) ^ ((u64)fn)) % STRUCT_MAX_NR;
++	if (!globl_offset[off])
++		asm volatile("ud2");
++	return fn;
++}
++
++EXPORT_SYMBOL(__sanitizer_struct_guard__);
+-- 
+1.8.3.1
+
